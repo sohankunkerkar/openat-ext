@@ -49,7 +49,7 @@ pub trait OpenatDirExt {
 
     /// Remove a file from the given directory; does not error if the target does
     /// not exist.  But will return an error if the target is a directory.
-    fn remove_file_optional<P: openat::AsPath>(&self, p: P) -> io::Result<()>;
+    fn remove_file_optional<P: openat::AsPath>(&self, p: P) -> io::Result<bool>;
 
     /// Remove an empty sub-directory from the given directory; does not error if the target does
     /// not exist.  But will return an error if the target is a file or symlink.
@@ -70,10 +70,10 @@ pub trait OpenatDirExt {
     fn exists<P: openat::AsPath>(&self, p: P) -> io::Result<bool>;
 
     /// Create a directory but don't error if it already exists.
-    fn ensure_dir<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<()>;
+    fn ensure_dir<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<bool>;
 
     /// Create directory and all parents as necessary; no error is returned if directory already exists.
-    fn ensure_dir_all<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<()>;
+    fn ensure_dir_all<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<bool>;
 
     /// Remove all content at the target path, returns `true` if something existed there.
     fn remove_all<P: openat::AsPath>(&self, p: P) -> io::Result<bool>;
@@ -83,7 +83,7 @@ pub trait OpenatDirExt {
     /// owner/group will be derived from the current process.  Extended attributes are not
     /// copied.  However, symbolic links will not be followed; instead an error is returned.
     /// If the filesystem supports it, reflinks will be used.
-    fn copy_file<S: openat::AsPath, D: openat::AsPath>(&self, s: S, d: D) -> io::Result<()>;
+    fn copy_file<S: openat::AsPath, D: openat::AsPath>(&self, s: S, d: D) -> io::Result<bool>;
 
     /// Copy a regular file.
     ///
@@ -94,7 +94,7 @@ pub trait OpenatDirExt {
         s: S,
         target_dir: &openat::Dir,
         d: D,
-    ) -> io::Result<()>;
+    ) -> io::Result<bool>;
 
     /// Create a `FileWriter` which provides a `std::io::BufWriter` and then atomically creates
     /// the file at the destination, renaming it over an existing one if necessary.
@@ -193,9 +193,8 @@ impl OpenatDirExt for openat::Dir {
         }
     }
 
-    fn remove_file_optional<P: openat::AsPath>(&self, p: P) -> io::Result<()> {
-        let _ = impl_remove_file_optional(self, p)?;
-        Ok(())
+    fn remove_file_optional<P: openat::AsPath>(&self, p: P) -> io::Result<bool> {
+        impl_remove_file_optional(self, p)
     }
 
     fn remove_dir_optional<P: openat::AsPath>(&self, p: P) -> io::Result<bool> {
@@ -258,12 +257,12 @@ impl OpenatDirExt for openat::Dir {
         }
     }
 
-    fn ensure_dir<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<()> {
+    fn ensure_dir<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<bool> {
         match self.create_dir(p, mode) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(e) => {
                 if e.kind() == io::ErrorKind::AlreadyExists {
-                    Ok(())
+                    Ok(false)
                 } else {
                     Err(e)
                 }
@@ -271,7 +270,7 @@ impl OpenatDirExt for openat::Dir {
         }
     }
 
-    fn ensure_dir_all<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<()> {
+    fn ensure_dir_all<P: openat::AsPath>(&self, p: P, mode: libc::mode_t) -> io::Result<bool> {
         let p = to_cstr(p)?;
         let p = p.as_ref();
         // Convert to a `Path` basically just so that we can call `.parent()` on it.
@@ -287,10 +286,10 @@ impl OpenatDirExt for openat::Dir {
                 _ => return Err(e),
             },
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn copy_file<S: openat::AsPath, D: openat::AsPath>(&self, s: S, d: D) -> io::Result<()> {
+    fn copy_file<S: openat::AsPath, D: openat::AsPath>(&self, s: S, d: D) -> io::Result<bool> {
         let src = self.open_file(s)?;
         impl_copy_regfile(&src, self, d)
     }
@@ -300,7 +299,7 @@ impl OpenatDirExt for openat::Dir {
         s: S,
         target_dir: &openat::Dir,
         d: D,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let src = self.open_file(s)?;
         impl_copy_regfile(&src, target_dir, d)
     }
@@ -356,16 +355,16 @@ fn impl_copy_regfile<D: openat::AsPath>(
     src: &File,
     target_dir: &openat::Dir,
     d: D,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let d = to_cstr(d)?;
     let d = OsStr::from_bytes(d.as_ref().to_bytes());
     let meta = src.metadata()?;
     // Start in mode 0600, we will replace with the actual bits after writing
     let mut w = target_dir.new_file_writer(d, 0o600)?;
     match copy_regfile_inner(src, &meta, &mut w) {
-        Ok(v) => {
+        Ok(_) => {
             w.complete()?;
-            Ok(v)
+            Ok(true)
         }
         Err(e) => {
             w.abandon();
@@ -428,25 +427,25 @@ pub(crate) fn impl_ensure_dir_all(d: &openat::Dir, p: &Path, mode: libc::mode_t)
             impl_ensure_dir_all(d, parent, mode)?;
         }
     }
-    d.ensure_dir(p, mode)?;
+    let _ = d.ensure_dir(p, mode)?;
     Ok(())
 }
 
-pub(crate) fn remove_children(d: &openat::Dir, iter: openat::DirIter) -> io::Result<()> {
+pub(crate) fn remove_children(d: &openat::Dir, iter: openat::DirIter) -> io::Result<bool> {
     for entry in iter {
         let entry = entry?;
         match d.get_file_type(&entry)? {
             openat::SimpleType::Dir => {
                 let subd = d.sub_dir(&entry)?;
-                remove_children(&subd, subd.list_dir(".")?)?;
+                let _ = remove_children(&subd, subd.list_dir(".")?)?;
                 let _ = d.remove_dir_optional(&entry)?;
             }
             _ => {
-                d.remove_file_optional(entry.file_name())?;
+                let _ = d.remove_file_optional(entry.file_name())?;
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn impl_remove_all<P: openat::AsPath>(d: &openat::Dir, p: P) -> io::Result<bool> {
@@ -461,7 +460,7 @@ fn impl_remove_all<P: openat::AsPath>(d: &openat::Dir, p: P) -> io::Result<bool>
                     libc::EISDIR => {
                         let iter = d.list_dir(cp)?;
                         let subd = d.sub_dir(cp)?;
-                        remove_children(&subd, iter)?;
+                        let _ = remove_children(&subd, iter)?;
                         d.remove_dir(cp)?;
                         Ok(true)
                     }
@@ -750,7 +749,7 @@ mod tests {
         let d = openat::Dir::open(td.path())?;
         d.write_file("foo", 0o644)?.sync_all()?;
         assert!(d.open_file_optional("foo")?.is_some());
-        d.remove_file_optional("foo")?;
+        let _ = d.remove_file_optional("foo")?;
         assert!(d.open_file_optional("foo")?.is_none());
         Ok(())
     }
@@ -785,12 +784,12 @@ mod tests {
         let d = openat::Dir::open(td.path())?;
         let mode = 0o755;
         let p = Path::new("foo/bar/baz");
-        d.ensure_dir_all(p, mode)?;
+        let _ = d.ensure_dir_all(p, mode)?;
         assert_eq!(d.metadata(p)?.stat().st_mode & !libc::S_IFMT, mode);
-        d.ensure_dir_all(p, mode)?;
-        d.ensure_dir_all("foo/bar", mode)?;
-        d.ensure_dir_all("foo", mode)?;
-        d.ensure_dir_all("bar", 0o700)?;
+        let _ = d.ensure_dir_all(p, mode)?;
+        let _ = d.ensure_dir_all("foo/bar", mode)?;
+        let _ = d.ensure_dir_all("foo", mode)?;
+        let _ = d.ensure_dir_all("bar", 0o700)?;
         assert_eq!(d.metadata("bar")?.stat().st_mode & !libc::S_IFMT, 0o700);
         Ok(())
     }
@@ -841,7 +840,7 @@ mod tests {
         let dst_dir = openat::Dir::open(dst_td.path()).unwrap();
 
         assert_eq!(dst_dir.exists("bar").unwrap(), false);
-        src_dir.copy_file_at("foo", &dst_dir, "bar").unwrap();
+        let _ = src_dir.copy_file_at("foo", &dst_dir, "bar").unwrap();
         assert_eq!(dst_dir.exists("bar").unwrap(), true);
 
         let srcbuf = {
